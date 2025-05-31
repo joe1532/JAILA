@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Simpelt søgescript - kun retrieval uden LLM
+OPTIMERET FOR PRÆCISE JURIDISKE FORESPØRGSLER
 """
 
 import weaviate
@@ -19,21 +20,56 @@ client = weaviate.Client(
     additional_headers={"X-OpenAI-Api-Key": openai_api_key}
 )
 
-# Kun felter der faktisk eksisterer i databasen
+# Kun felter der faktisk eksisterer i databasen - OPDATERET TIL NY SCHEMA
 ALL_FIELDS = [
+    # Grundlæggende felter
     "chunk_id", "title", "text", "text_for_embedding", "type", "topic", 
-    "keywords", "entities", "rule_type", "law_number", "status", 
+    "document_name", "law_number", "status", "date",
+    
+    # LLM genererede felter
+    "summary", "keywords", "entities", "rule_type", "rule_type_confidence", 
+    "rule_type_explanation", "interpretation_flag", "llm_model_used",
+    
+    # Strukturelle felter
+    "section", "paragraph", "stk", "nr", "heading",
+    
+    # Relations felter
     "note_reference_ids", "related_note_chunks", "related_paragraph_chunk_id",
-    "summary", "dom_references", "date", "document_name"
+    "related_paragraph_ref", "related_paragraph_text", "related_paragraphs",
+    
+    # Metadata felter
+    "note_references", "notes", "note_number", "dom_references"
 ]
 
+# LOV-SPECIFIKKE FILTRE - OPTIMERET FOR PRÆCIS SØGNING
+LAW_FILTERS = {
+    'ligningsloven': 'Ligningsloven',
+    'kildeskatteloven': 'Kildeskatteloven', 
+    'aktieavancebeskatningsloven': 'Aktieavancebeskatningsloven',
+    'statsskatteloven': 'Statsskatteloven',
+    'ligningslov': 'Ligningsloven',
+    'kildeskattelov': 'Kildeskatteloven',
+    'aktieavancebeskatningslov': 'Aktieavancebeskatningsloven',
+    'statsskattelov': 'Statsskatteloven'
+}
+
+def detect_law_filter(query):
+    """Detekterer hvilken lov der refereres til i forespørgslen"""
+    query_lower = query.lower()
+    
+    for law_key, law_title in LAW_FILTERS.items():
+        if law_key in query_lower:
+            print(f"🎯 Detekteret lov-filter: {law_title}")
+            return law_title
+    
+    return None
+
 def detect_paragraph_references(query):
-    """Detekterer §-referencer i spørgsmål - nu også med bogstaver"""
+    """Detekterer §-referencer i spørgsmål - FORBEDRET med stykke-matching"""
     patterns = [
         r'§\s*(\d+\s*[a-zA-Z]*)',       # § 15, § 33 A, § 15a osv.
         r'paragraf\s*(\d+\s*[a-zA-Z]*)', # paragraf 15, paragraf 33 A osv.
         r'section\s*(\d+\s*[a-zA-Z]*)',  # section 15, section 33 A osv.
-        r'stk\.?\s*(\d+)',               # stk. 15 eller stk 15 (kun tal)
     ]
     
     references = []
@@ -44,6 +80,20 @@ def detect_paragraph_references(query):
         references.extend(normalized_matches)
     
     return list(set(references))
+
+def detect_stykke_references(query):
+    """Detekterer stykke-referencer i spørgsmål - NY FUNKTION"""
+    patterns = [
+        r'stk\.?\s*(\d+)',     # stk. 7, stk 7
+        r'stykke\s*(\d+)',     # stykke 7
+    ]
+    
+    stykke_refs = []
+    for pattern in patterns:
+        matches = re.findall(pattern, query.lower())
+        stykke_refs.extend(matches)
+    
+    return list(set(stykke_refs))
 
 def detect_chunk_id(query):
     """Detekterer om query er et chunk ID (UUID format)"""
@@ -76,14 +126,15 @@ def chunk_search(chunk_id):
                 print(f"📝 Henter {len(related_notes)} relaterede noter...")
                 
                 for note_id in related_notes:
-                    note_results = client.query.get("LegalDocument", ALL_FIELDS).with_where({
-                        "path": ["chunk_id"],
-                        "operator": "Equal",
-                        "valueText": note_id
-                    }).do()
-                    
-                    note_docs = note_results.get('data', {}).get('Get', {}).get('LegalDocument', [])
-                    all_results.extend(note_docs)
+                    if note_id:  # Tjek at note_id ikke er None
+                        note_results = client.query.get("LegalDocument", ALL_FIELDS).with_where({
+                            "path": ["chunk_id"],
+                            "operator": "Equal",
+                            "valueText": note_id
+                        }).do()
+                        
+                        note_docs = note_results.get('data', {}).get('Get', {}).get('LegalDocument', [])
+                        all_results.extend([doc for doc in note_docs if doc])  # Kun tilføj ikke-None docs
             
             # Hvis det er en note, hent relateret paragraf
             elif doc.get('type') == 'notes':
@@ -98,7 +149,7 @@ def chunk_search(chunk_id):
                     }).do()
                     
                     para_docs = para_results.get('data', {}).get('Get', {}).get('LegalDocument', [])
-                    all_results.extend(para_docs)
+                    all_results.extend([doc for doc in para_docs if doc])  # Kun tilføj ikke-None docs
             
             return all_results
         
@@ -109,106 +160,179 @@ def chunk_search(chunk_id):
         return []
 
 def paragraph_search(query, limit=5):
-    """Søg efter specifikke paragraffer - optimeret prioritering"""
+    """OPTIMERET PARAGRAF SØGNING - med lov-filtrering og præcis stykke-matching"""
     paragraph_refs = detect_paragraph_references(query)
+    stykke_refs = detect_stykke_references(query)
+    law_filter = detect_law_filter(query)
     
     if not paragraph_refs:
         return None
         
     print(f"🎯 Detekterede paragraffer: {', '.join([f'§ {ref}' for ref in paragraph_refs])}")
+    if stykke_refs:
+        print(f"🎯 Detekterede stykker: {', '.join([f'stk. {ref}' for ref in stykke_refs])}")
     
     all_results = []
     
     for paragraph_ref in paragraph_refs:
         try:
-            # Prioriteret søgning: mest specifikke først
-            priority_patterns = [
-                f"§ {paragraph_ref.lower()}",        # "§ 33 a" - præcis topic match
-                f"§ {paragraph_ref}",                # "§ 33 A" - præcis input match
-                paragraph_ref.lower(),               # "33 a" - kort topic match
-                paragraph_ref,                       # "33 A" - kort input match
-            ]
+            # HIERARKISK SØGNING - mest specifikke først
+            search_strategies = []
             
-            # Søg først efter høj-prioritets matches
-            for search_pattern in priority_patterns:
-                # Søg i topic først (højest relevans for paragraffer)
-                topic_where = {
-                    "operator": "And",
-                    "operands": [
-                        {
-                            "path": ["topic"],
-                            "operator": "Like",
-                            "valueText": f"*{search_pattern}*"
-                        },
-                        {
-                            "path": ["type"],
-                            "operator": "Equal",
-                            "valueText": "paragraf"
-                        }
-                    ]
-                }
+            # Hvis både paragraf og stykke specificeret - HØJESTE PRIORITET
+            if stykke_refs:
+                for stykke_ref in stykke_refs:
+                    search_strategies.append({
+                        'priority': 1,
+                        'type': 'exact_paragraph_stykke',
+                        'where': build_precise_where_clause(paragraph_ref, stykke_ref, law_filter),
+                        'description': f"§ {paragraph_ref}, stk. {stykke_ref}" + (f" i {law_filter}" if law_filter else ""),
+                        'limit': 50  # Øget limit
+                    })
+            
+            # Paragraf med lov-filter - HØJ PRIORITET
+            if law_filter:
+                search_strategies.append({
+                    'priority': 2,
+                    'type': 'paragraph_with_law',
+                    'where': build_paragraph_law_where_clause(paragraph_ref, law_filter),
+                    'description': f"§ {paragraph_ref} i {law_filter}",
+                    'limit': 100  # Øget limit
+                })
+            
+            # Kun paragraf - MEDIUM PRIORITET
+            search_strategies.append({
+                'priority': 3,
+                'type': 'paragraph_only',
+                'where': build_paragraph_where_clause(paragraph_ref),
+                'description': f"§ {paragraph_ref}",
+                'limit': 200  # Øget limit
+            })
+            
+            # Udfør søgninger i prioritets-rækkefølge
+            found_results = False
+            for strategy in sorted(search_strategies, key=lambda x: x['priority']):
+                print(f"🔍 Søger: {strategy['description']}")
                 
-                topic_results = client.query.get("LegalDocument", ALL_FIELDS).with_where(topic_where).with_limit(5).do()
-                topic_documents = topic_results.get('data', {}).get('Get', {}).get('LegalDocument', [])
+                results = client.query.get("LegalDocument", ALL_FIELDS).with_where(strategy['where']).with_limit(strategy['limit']).do()
+                documents = results.get('data', {}).get('Get', {}).get('LegalDocument', [])
                 
-                # Tilføj topic resultater først (højest relevans)
-                for doc in topic_documents:
-                    if not any(existing['chunk_id'] == doc['chunk_id'] for existing in all_results):
+                if documents:
+                    found_results = True
+                    
+                for doc in documents:
+                    if doc and not any(existing and existing.get('chunk_id') == doc.get('chunk_id') for existing in all_results):
                         all_results.append(doc)
                         
-                        # Hent relaterede noter
-                        related_notes = doc.get('related_note_chunks', [])
-                        for note_id in related_notes[:1]:  # Kun 1 note per paragraf for at undgå overload
-                            note_results = client.query.get("LegalDocument", ALL_FIELDS).with_where({
-                                "path": ["chunk_id"],
-                                "operator": "Equal",
-                                "valueText": note_id
-                            }).do()
-                            
-                            note_docs = note_results.get('data', {}).get('Get', {}).get('LegalDocument', [])
-                            for note_doc in note_docs:
-                                if not any(existing['chunk_id'] == note_doc['chunk_id'] for existing in all_results):
-                                    all_results.append(note_doc)
+                        # Tilføj relaterede noter for paragraffer
+                        if doc.get('type') == 'paragraf':
+                            related_notes = doc.get('related_note_chunks', [])
+                            if related_notes:
+                                for note_id in related_notes[:1]:  # Maksimalt 1 note per paragraf
+                                    if note_id:
+                                        note_results = client.query.get("LegalDocument", ALL_FIELDS).with_where({
+                                            "path": ["chunk_id"],
+                                            "operator": "Equal",
+                                            "valueText": note_id
+                                        }).do()
+                                        
+                                        note_docs = note_results.get('data', {}).get('Get', {}).get('LegalDocument', [])
+                                        for note_doc in note_docs:
+                                            if note_doc and not any(existing and existing.get('chunk_id') == note_doc.get('chunk_id') for existing in all_results):
+                                                all_results.append(note_doc)
                 
-                # Stop hvis vi har nok gode topic resultater
-                if len(all_results) >= limit:
+                # Stop hvis vi har nok høj-prioritets resultater
+                if strategy['priority'] <= 2 and len(all_results) >= limit:
                     break
             
-            # Kun søg i tekst hvis vi mangler resultater
-            if len(all_results) < limit:
-                for search_pattern in priority_patterns:
-                    text_where = {
-                        "operator": "And",
-                        "operands": [
-                            {
-                                "path": ["text"],
-                                "operator": "Like", 
-                                "valueText": f"*{search_pattern}*"
-                            },
-                            {
-                                "path": ["type"],
-                                "operator": "Equal",
-                                "valueText": "paragraf"
-                            }
-                        ]
-                    }
-                    
-                    text_results = client.query.get("LegalDocument", ALL_FIELDS).with_where(text_where).with_limit(3).do()
-                    text_documents = text_results.get('data', {}).get('Get', {}).get('LegalDocument', [])
-                    
-                    for doc in text_documents:
-                        if not any(existing['chunk_id'] == doc['chunk_id'] for existing in all_results):
-                            all_results.append(doc)
-                    
-                    # Stop hvis vi har nok resultater
-                    if len(all_results) >= limit:
-                        break
+            # Hvis WHERE-søgning ikke gav resultater, prøv fallback
+            if not found_results:
+                print(f"⚠️  WHERE-søgning gav ingen resultater - prøver fallback")
+                fallback_results = fallback_manual_search(query, limit)
+                if fallback_results:
+                    all_results.extend(fallback_results)
+                    found_results = True
                     
         except Exception as e:
             print(f"❌ Fejl ved paragraf søgning for § {paragraph_ref}: {e}")
+            # Prøv fallback ved fejl
+            print(f"🔄 Prøver fallback efter fejl...")
+            fallback_results = fallback_manual_search(query, limit)
+            if fallback_results:
+                all_results.extend(fallback_results)
             continue
     
     return all_results[:limit] if all_results else None
+
+def build_precise_where_clause(paragraph_ref, stykke_ref, law_filter=None):
+    """Bygger præcis WHERE clause for paragraf + stykke + evt. lov"""
+    conditions = [
+        {
+            "path": ["paragraph"],
+            "operator": "Equal",
+            "valueText": f"§ {paragraph_ref}"
+        },
+        {
+            "path": ["stk"],
+            "operator": "Equal",
+            "valueText": stykke_ref
+        },
+        {
+            "path": ["type"],
+            "operator": "Equal",
+            "valueText": "paragraf"
+        }
+    ]
+    
+    if law_filter:
+        conditions.append({
+            "path": ["title"],
+            "operator": "Equal",
+            "valueText": law_filter
+        })
+    
+    return {"operator": "And", "operands": conditions}
+
+def build_paragraph_law_where_clause(paragraph_ref, law_filter):
+    """Bygger WHERE clause for paragraf + lov"""
+    return {
+        "operator": "And",
+        "operands": [
+            {
+                "path": ["paragraph"],
+                "operator": "Equal",
+                "valueText": f"§ {paragraph_ref}"
+            },
+            {
+                "path": ["title"],
+                "operator": "Equal",
+                "valueText": law_filter
+            },
+            {
+                "path": ["type"],
+                "operator": "Equal",
+                "valueText": "paragraf"
+            }
+        ]
+    }
+
+def build_paragraph_where_clause(paragraph_ref):
+    """Bygger WHERE clause for kun paragraf - FORBEDRET med højere limit"""
+    return {
+        "operator": "And",
+        "operands": [
+            {
+                "path": ["paragraph"],
+                "operator": "Equal",
+                "valueText": f"§ {paragraph_ref}"
+            },
+            {
+                "path": ["type"],
+                "operator": "Equal",
+                "valueText": "paragraf"
+            }
+        ]
+    }
 
 def semantic_search(query, limit=5):
     """Semantisk søgning med Weaviate"""
@@ -251,6 +375,17 @@ def print_results(results, search_type=""):
         print(f"   Type: {result.get('type', 'N/A')}")
         print(f"   Titel: {result.get('title', 'N/A')}")
         print(f"   Topic: {result.get('topic', 'N/A')}")
+        
+        # Vis strukturelle felter
+        if result.get('section'):
+            print(f"   Sektion: {result.get('section', 'N/A')}")
+        if result.get('paragraph'):
+            print(f"   Paragraf: {result.get('paragraph', 'N/A')}")
+        if result.get('stk'):
+            print(f"   Stykke: {result.get('stk', 'N/A')}")
+        if result.get('heading'):
+            print(f"   Overskrift: {result.get('heading', 'N/A')}")
+        
         print(f"   Lov: {result.get('law_number', 'N/A')}")
         print(f"   Status: {result.get('status', 'N/A')}")
         
@@ -259,7 +394,9 @@ def print_results(results, search_type=""):
             print(f"   Keywords: {keywords}")
         
         if result.get('rule_type'):
-            print(f"   Rule type: {result.get('rule_type', 'N/A')}")
+            confidence = result.get('rule_type_confidence', '')
+            confidence_str = f" ({confidence})" if confidence else ""
+            print(f"   Rule type: {result.get('rule_type', 'N/A')}{confidence_str}")
         
         # Vis relationer
         if result.get('related_note_chunks'):
@@ -268,6 +405,10 @@ def print_results(results, search_type=""):
         
         if result.get('related_paragraph_chunk_id'):
             print(f"   Relateret paragraf: {result['related_paragraph_chunk_id']}")
+        
+        # Vis fortolkningsflag hvis relevant
+        if result.get('interpretation_flag'):
+            print(f"   🔍 Fortolkning: Ja")
         
         text = result.get('text', '')
         if text:
@@ -419,6 +560,95 @@ def interactive_search():
             break
         except EOFError:
             break
+
+def fallback_manual_search(query, limit=5):
+    """Fallback: Manuel søgning gennem alle dokumenter når WHERE ikke virker"""
+    paragraph_refs = detect_paragraph_references(query)
+    stykke_refs = detect_stykke_references(query)
+    law_filter = detect_law_filter(query)
+    
+    if not paragraph_refs:
+        return None
+    
+    print(f"🔄 FALLBACK: Manuel søgning gennem database")
+    print(f"   Target: § {paragraph_refs[0]}" + (f", stk. {stykke_refs[0]}" if stykke_refs else "") + (f" i {law_filter}" if law_filter else ""))
+    
+    # Hent mange dokumenter i batches
+    all_results = []
+    batch_size = 1000
+    total_fetched = 0
+    
+    try:
+        # Hent dokumenter i batches
+        for offset in range(0, 4000, batch_size):  # Maksimalt 4000 dokumenter
+            results = client.query.get("LegalDocument", ALL_FIELDS).with_limit(batch_size).with_offset(offset).do()
+            batch_docs = results.get('data', {}).get('Get', {}).get('LegalDocument', [])
+            
+            if not batch_docs:  # Ingen flere dokumenter
+                break
+                
+            total_fetched += len(batch_docs)
+            
+            # Filtrér lokalt
+            for doc in batch_docs:
+                if not doc:
+                    continue
+                    
+                # Check paragraf match
+                doc_paragraph = doc.get('paragraph', '')
+                target_paragraph = f"§ {paragraph_refs[0]}"
+                
+                if doc_paragraph != target_paragraph:
+                    continue
+                
+                # Check lov filter
+                if law_filter and law_filter not in doc.get('title', ''):
+                    continue
+                
+                # Check stykke filter
+                if stykke_refs and doc.get('stk') != stykke_refs[0]:
+                    continue
+                
+                # Check type
+                if doc.get('type') != 'paragraf':
+                    continue
+                
+                # Tilføj match
+                all_results.append(doc)
+                
+                # Tilføj relaterede noter
+                if doc.get('type') == 'paragraf':
+                    related_notes = doc.get('related_note_chunks', [])
+                    if related_notes:
+                        for note_id in related_notes[:1]:  # Maksimalt 1 note
+                            if note_id:
+                                note_results = client.query.get("LegalDocument", ALL_FIELDS).with_where({
+                                    "path": ["chunk_id"],
+                                    "operator": "Equal",
+                                    "valueText": note_id
+                                }).do()
+                                
+                                note_docs = note_results.get('data', {}).get('Get', {}).get('LegalDocument', [])
+                                for note_doc in note_docs:
+                                    if note_doc and not any(existing and existing.get('chunk_id') == note_doc.get('chunk_id') for existing in all_results):
+                                        all_results.append(note_doc)
+                
+                # Stop hvis vi har nok resultater
+                if len(all_results) >= limit * 2:  # Mere plads til noter
+                    break
+            
+            # Stop hvis vi har fundet nok
+            if len(all_results) >= limit * 2:
+                break
+        
+        print(f"   📊 Søgte gennem {total_fetched} dokumenter")
+        print(f"   🎯 Fandt {len(all_results)} matches")
+        
+        return all_results[:limit] if all_results else None
+        
+    except Exception as e:
+        print(f"❌ Fejl ved manual søgning: {e}")
+        return None
 
 if __name__ == "__main__":
     main() 
