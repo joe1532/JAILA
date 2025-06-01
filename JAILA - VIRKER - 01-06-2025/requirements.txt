@@ -1,0 +1,34 @@
+# MULTIHOP RAG REQUIREMENTS
+# LangChain Multihop Juridisk RAG System
+
+# === CORE LANGCHAIN ===
+langchain==0.0.354
+langchain-openai==0.0.5
+langchain-community==0.0.10
+
+# === LLM PROVIDERS ===
+openai>=1.0.0
+
+# === VECTOR DATABASES ===
+weaviate-client==3.25.3
+
+# === CORE DEPENDENCIES ===
+python-dotenv==1.0.0
+tiktoken==0.5.2
+tenacity==8.2.3
+
+# === DATA PROCESSING ===
+numpy==1.24.3
+pandas==2.0.3
+
+# === ASYNC SUPPORT ===
+asyncio==3.4.3
+aiohttp==3.9.1
+
+# === VALIDATION & PARSING ===
+pydantic==2.5.2
+pydantic-core==2.14.5
+
+# === UTILITIES ===
+tqdm==4.66.1
+colorama==0.4.6 
